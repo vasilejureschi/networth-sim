@@ -1,11 +1,12 @@
-# app.py — Lifetime wealth simulator (Streamlit UI)
-# Features:
-# - Flexible compounding ages (0–110)
-# - % of income spent (whole living cost) OR optional essentials+discretionary mode
-# - Mortgage starts after down payment, mortgage params exposed
-# - Random life events, human-plausible by age
-# - Borrowing mode: negative wealth accrues debt interest APR
-# - Legends placed below the plot so the chart stays visible
+# app.py — Lifetime wealth simulator (5-year incomes, Essentials + Discretionary %)
+# - Income entered per 5-year bucket between IncomeStart..IncomeEnd
+# - Compounding ages independent from income ages (0–110 allowed)
+# - Spending model: Essentials € + Discretionary %  (default ON)
+#   • Option: apply discretionary after mortgage too
+# - Borrowing toggle + Debt APR (applies to negative wealth)
+# - Mortgage parameters exposed; mortgage begins after down payment is saved
+# - Life events realistic by age; none before IncomeStart
+# - Legends placed below the chart
 
 import numpy as np
 import pandas as pd
@@ -13,7 +14,7 @@ import matplotlib.pyplot as plt
 import streamlit as st
 from matplotlib.lines import Line2D
 
-# ---------------- Utilities ----------------
+# ---------- Helpers ----------
 
 def annuity_payment(principal, annual_rate, years):
     r = annual_rate / 12.0
@@ -25,29 +26,29 @@ def annuity_payment(principal, annual_rate, years):
 def sample_life_events(start_age, end_age, earn_start_age=25, rng_seed=137):
     """Life-like events after earn_start_age; returns [(age, cost, label), ...]."""
     rng = np.random.default_rng(rng_seed)
-    events = []
+    ev = []
 
     # 1) Wedding/Honeymoon (25–35, ~60% once)
     if rng.random() < 0.6 and end_age >= max(earn_start_age, 25):
-        age = int(rng.integers(max(earn_start_age, 25), min(35, end_age) + 1))
-        events.append((age, rng.uniform(5_000, 20_000), "Wedding/Honeymoon"))
+        a = int(rng.integers(max(earn_start_age, 25), min(35, end_age) + 1))
+        ev.append((a, rng.uniform(5_000, 20_000), "Wedding/Honeymoon"))
         if rng.random() < 0.3:
-            events.append((age, rng.uniform(3_000, 10_000), "Relocation after wedding"))
+            ev.append((a, rng.uniform(3_000, 10_000), "Relocation after wedding"))
 
-    # 2) Children 0–3 between 26–38
+    # 2) Children (0–3) 26–38
     n_kids = int(rng.choice([0,1,2,3], p=[0.35,0.35,0.22,0.08]))
     kid_ages = []
     for _ in range(n_kids):
         if end_age >= max(earn_start_age, 26):
             a = int(rng.integers(max(earn_start_age, 26), min(38, end_age) + 1))
             kid_ages.append(a)
-            events.append((a, rng.uniform(4_000, 12_000), "Child birth/setup"))
+            ev.append((a, rng.uniform(4_000, 12_000), "Child birth/setup"))
 
     # 3) Car cycles: first 25–35, then every 8–12 yrs until ~75
     if end_age >= max(earn_start_age, 25):
         a = int(rng.integers(max(earn_start_age, 25), min(35, end_age) + 1))
         while a <= min(75, end_age):
-            events.append((a, rng.uniform(8_000, 25_000), "Car purchase/major repair"))
+            ev.append((a, rng.uniform(8_000, 25_000), "Car purchase/major repair"))
             a += int(rng.integers(8, 13))
 
     # 4) Home renovation: 30–60, 0–2 times
@@ -55,20 +56,20 @@ def sample_life_events(start_age, end_age, earn_start_age=25, rng_seed=137):
     for _ in range(renos):
         if end_age >= max(earn_start_age, 30):
             a = int(rng.integers(max(earn_start_age, 30), min(60, end_age) + 1))
-            events.append((a, rng.uniform(10_000, 40_000), "Home renovation"))
+            ev.append((a, rng.uniform(10_000, 40_000), "Home renovation"))
 
     # 5) Parental support: 45–65, 0–2 times
     sup = int(rng.choice([0,1,2], p=[0.5,0.35,0.15]))
     for _ in range(sup):
         if end_age >= max(earn_start_age, 45):
             a = int(rng.integers(max(earn_start_age, 45), min(65, end_age) + 1))
-            events.append((a, rng.uniform(5_000, 20_000), "Parental support"))
+            ev.append((a, rng.uniform(5_000, 20_000), "Parental support"))
 
     # 6) College contributions (kid birth age + 18)
     for ba in kid_ages:
         ca = ba + 18
         if earn_start_age <= ca <= end_age:
-            events.append((ca, rng.uniform(10_000, 40_000), "College contribution"))
+            ev.append((ca, rng.uniform(10_000, 40_000), "College contribution"))
 
     # 7) Medical procedures: 45+, probability rises with age (max 20%/yr)
     for a in range(max(earn_start_age, 45), end_age + 1):
@@ -78,51 +79,52 @@ def sample_life_events(start_age, end_age, earn_start_age=25, rng_seed=137):
             mu, sigma = np.log(max(scale, 1.0)), 0.6
             cost = float(np.exp(rng.normal(mu, sigma)))
             cost = float(np.clip(cost, 5_000, 120_000))
-            events.append((a, cost, "Medical procedure"))
+            ev.append((a, cost, "Medical procedure"))
 
-    # 8) Long-term care: 75+, at most once, ~12%/yr
-    ltc_done = False
+    # 8) Long-term care: 75+, ~12%/yr, at most once
+    ltc = False
     for a in range(max(earn_start_age, 75), end_age + 1):
-        if not ltc_done and np.random.default_rng(rng.integers(0, 10**9)).random() < 0.12:
-            cost = np.random.default_rng(rng.integers(0, 10**9)).uniform(50_000, 200_000)
-            events.append((a, cost, "Long-term care"))
-            ltc_done = True
+        if not ltc and np.random.default_rng(rng.integers(0, 10**9)).random() < 0.12:
+            ev.append((a, np.random.default_rng(rng.integers(0, 10**9)).uniform(50_000, 200_000), "Long-term care"))
+            ltc = True
 
     # Filter + combine same-age events
-    events = [(a, c, lab) for (a, c, lab) in events if a >= earn_start_age]
+    ev = [(a, c, label) for (a, c, label) in ev if a >= earn_start_age]
     by_age, labels = {}, {}
-    for a, c, lab in events:
+    for a, c, label in ev:
         by_age[a] = by_age.get(a, 0.0) + c
-        labels.setdefault(a, []).append(lab)
+        labels.setdefault(a, []).append(label)
     return [(a, by_age[a], ", ".join(labels[a])) for a in sorted(by_age.keys())]
 
-# ---------------- Simulation core ----------------
+def monthly_income_from_schedule(age, schedule):
+    """schedule: list of dicts [{'start': 25, 'end': 30, 'monthly': 4000}, ...]"""
+    for b in schedule:
+        if b["start"] <= age < b["end"]:
+            return float(b["monthly"])
+    return 0.0
+
+# ---------- Simulation ----------
 
 def run_sim(
-    monthly_income,
-    earn_start_age,
-    earn_end_age,
-    percent_income_spent,               # if essentials_mode=False: total living cost % of income
-    growth_rate,                         # portfolio CAGR while compounding ages
-    start_age=0,
-    end_age=90,
+    income_schedule,           # list of buckets [{'start','end','monthly'}]
+    income_start_age,          # used to gate life events
+    comp_start_age, comp_end_age,
+    essentials_per_year,       # fixed € essentials when earning
+    discretionary_pct,         # % applied to leftover after essentials (and maybe mortgage)
+    apply_disc_after_mortgage, # bool
+    growth_rate,               # CAGR while age in [comp_start, comp_end]
+    start_age=0, end_age=90,
     rng_seed=137,
     # Mortgage
-    house_price=250_000.0,
-    down_pct=0.20,
-    mortgage_rate=0.04,
-    mortgage_years=30,
+    house_price=250_000.0, down_pct=0.20, mortgage_rate=0.04, mortgage_years=30,
     # Borrowing
-    allow_borrowing=False,
-    debt_apr=0.10,                       # annual interest applied to negative wealth
-    # Optional essentials + discretionary
-    essentials_mode=False,
-    essentials_per_year=18_000.0,
+    allow_borrowing=False, debt_apr=0.10,
+    starting_wealth: float = 0.0
 ):
-    events = sample_life_events(start_age, end_age, earn_start_age=earn_start_age, rng_seed=rng_seed)
+    events = sample_life_events(start_age, end_age, earn_start_age=income_start_age, rng_seed=rng_seed)
     event_costs = {a: cost for a, cost, _ in events}
 
-    wealth = 0.0
+    wealth = float(starting_wealth)
     saved_for_down = 0.0
     mortgage_start_age = None
     mortgage_end_age = None
@@ -131,24 +133,16 @@ def run_sim(
     ages, values = [], []
 
     for age in range(start_age, end_age + 1):
-        earning = (earn_start_age <= age < earn_end_age)
-        compounding = (earn_start_age <= age <= earn_end_age)  # inclusive end if desired
+        monthly_income = monthly_income_from_schedule(age, income_schedule)
+        earning = monthly_income > 0.0
+        compounding = (comp_start_age <= age <= comp_end_age)
 
-        yearly_income = (monthly_income * 12.0) if earning else 0.0
+        yearly_income = monthly_income * 12.0 if earning else 0.0
 
-        # Spending model
-        if essentials_mode and earning:
-            # Essentials are fixed €/year, then discretionary is % of leftover after essentials + mortgage
-            base_essentials = max(0.0, essentials_per_year)
-            discretionary_base = max(0.0, yearly_income - base_essentials)
-            living_expenses_pre_mortgage = base_essentials + (percent_income_spent/100.0) * discretionary_base
-        elif earning:
-            # Simple model: the % is the whole living cost
-            living_expenses_pre_mortgage = yearly_income * (percent_income_spent/100.0)
-        else:
-            living_expenses_pre_mortgage = 0.0
+        # --- Spending model: essentials + discretionary % ---
+        essentials = essentials_per_year if earning else 0.0
 
-        # Decide if mortgage starts this year (after surplus saved for down payment)
+        # If mortgage is active, we might apply discretionary after mortgage too.
         down_needed = house_price * down_pct
         if mortgage_start_age is None and earning and saved_for_down >= down_needed:
             mortgage_start_age = age
@@ -156,156 +150,178 @@ def run_sim(
             principal = house_price * (1.0 - down_pct)
             monthly_mortgage = annuity_payment(principal, mortgage_rate, mortgage_years)
 
-        mortgage_expense = 0.0
-        if mortgage_start_age is not None and mortgage_start_age <= age < mortgage_end_age:
-            mortgage_expense = monthly_mortgage * 12.0
+        mortgage_expense = (monthly_mortgage * 12.0
+                            if (mortgage_start_age is not None and mortgage_start_age <= age < mortgage_end_age)
+                            else 0.0)
+
+        # Discretionary base
+        if apply_disc_after_mortgage:
+            discretionary_base = max(0.0, yearly_income - essentials - mortgage_expense)
+        else:
+            discretionary_base = max(0.0, yearly_income - essentials)
+
+        discretionary = (discretionary_pct / 100.0) * discretionary_base if earning else 0.0
 
         life_event_expense = event_costs.get(age, 0.0)
 
-        yearly_expenses = living_expenses_pre_mortgage + mortgage_expense + life_event_expense
-        net_annual = yearly_income - yearly_expenses
+        yearly_expenses = essentials + discretionary + mortgage_expense + life_event_expense
+        net = yearly_income - yearly_expenses
 
-        # Accumulate down payment savings only before mortgage starts (from positive surplus)
-        if mortgage_start_age is None and net_annual > 0 and earning:
-            saved_for_down += net_annual
+        # Save surplus for down payment pre-mortgage
+        if mortgage_start_age is None and net > 0 and earning:
+            saved_for_down += net
 
-        # Wealth update before interest
-        wealth += net_annual
+        # Update wealth before interest
+        wealth += net
 
-        # Apply interest next: portfolio growth on positive wealth during compounding,
-        # debt APR on negative wealth (always, if borrowing allowed). If borrowing is NOT allowed,
-        # floor at zero before applying growth.
-        if not allow_borrowing and wealth < 0:
-            wealth = 0.0
-
+        # Apply compounding or debt APR
         if wealth >= 0:
             if compounding:
                 wealth *= (1.0 + growth_rate)
         else:
-            # Negative wealth = debt; apply debt interest
-            wealth *= (1.0 + debt_apr)
+            if allow_borrowing:
+                wealth *= (1.0 + debt_apr)
+            else:
+                wealth = 0.0
 
         ages.append(age)
         values.append(wealth)
 
-    df_events = pd.DataFrame([{"Age": a, "Event": lab, "Cost (€)": round(cost,2)} for a, cost, lab in events])
+    df_events = pd.DataFrame([{"Age": a, "Event": label, "Cost (€)": round(cost,2)} for a, cost, label in events])
+    return {"ages": ages, "values": values, "events": events,
+            "mortgage_start_age": mortgage_start_age, "df_events": df_events}
 
-    return {
-        "ages": ages,
-        "values": values,
-        "events": events,
-        "mortgage_start_age": mortgage_start_age,
-        "df_events": df_events,
-    }
-
-def make_figure(res, monthly_income, earn_start_age, earn_end_age, percent_income_spent,
-                essentials_mode, essentials_per_year):
+def make_figure(res, comp_start_age, comp_end_age, essentials_per_year,
+                discretionary_pct, apply_disc_after_mortgage, income_desc):
     ages, values = res["ages"], res["values"]
     events = res["events"]
     mortgage_start_age = res["mortgage_start_age"]
 
-    fig, ax = plt.subplots(figsize=(11, 7))
+    fig, ax = plt.subplots(figsize=(11,7))
     ax.plot(ages, values)
     ax.set_xlabel("Age (years)")
     ax.set_ylabel("Total Value (€)")
-    ax.set_title("Wealth over Life: Mortgage + Spending + Events + Borrowing")
+    ax.set_title("Wealth over Life: 5-year Income + Essentials & Discretionary + Mortgage + Borrowing + Events")
     ax.grid(True)
 
-    event_handles, event_labels = [], []
+    ev_handles, ev_labels = [], []
     if mortgage_start_age is not None:
-        mlabel = f"Mortgage start @ {mortgage_start_age}"
-        h = ax.axvline(mortgage_start_age, linestyle="--", linewidth=1.6, label=mlabel)
-        event_handles.append(h); event_labels.append(mlabel)
+        lbl = f"Mortgage start @ {mortgage_start_age}"
+        h = ax.axvline(mortgage_start_age, linestyle="--", linewidth=1.6, label=lbl)
+        ev_handles.append(h); ev_labels.append(lbl)
 
-    for (age, cost, lab) in events:
-        elabel = f"{lab} €{int(round(cost,0))} @ age {age}"
-        h = ax.axvline(age, linestyle=":", linewidth=1.0, label=elabel)
-        event_handles.append(h); event_labels.append(elabel)
+    for (a, c, lab) in events:
+        lbl = f"{lab} €{int(round(c,0))} @ age {a}"
+        h = ax.axvline(a, linestyle=":", linewidth=1.0, label=lbl)
+        ev_handles.append(h); ev_labels.append(lbl)
 
-    # Legend A (income setup) — below
-    income_handles = [Line2D([0],[0], linestyle='-')]
-    mode_txt = ("essentials+discretionary" if essentials_mode else "percent = total living cost")
-    inc_lbl = f"€{monthly_income}/mo; spend={percent_income_spent:.0f}% ({mode_txt}); comp {earn_start_age}–{earn_end_age}"
-    if essentials_mode:
-        inc_lbl += f"; essentials≈€{essentials_per_year:,.0f}/yr"
-    leg1 = ax.legend(income_handles, [inc_lbl], title="Income setup",
+    inc_line = Line2D([0],[0], linestyle='-')
+    mode = "disc. after mortgage" if apply_disc_after_mortgage else "disc. before mortgage"
+    setup = f"{income_desc}; essentials≈€{essentials_per_year:,.0f}/yr; disc={discretionary_pct:.0f}% ({mode}); comp {comp_start_age}–{comp_end_age}"
+    leg1 = ax.legend([inc_line], [setup], title="Setup",
                      loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=1, frameon=True)
     ax.add_artist(leg1)
 
-    # Legend B (events) — below
-    if event_handles:
-        ax.legend(event_handles, event_labels, title="Events",
+    if ev_handles:
+        ax.legend(ev_handles, ev_labels, title="Events",
                   loc="upper center", bbox_to_anchor=(0.5, -0.38), ncol=2, frameon=True)
     plt.tight_layout()
     return fig
 
-# ---------------- UI ----------------
+# ---------- UI ----------
 
-st.set_page_config(page_title="Lifetime Wealth Simulator", layout="wide")
-
+st.set_page_config(page_title="Lifetime Wealth Simulator (5-year incomes)", layout="wide")
 st.title("Lifetime Wealth Simulator")
-st.caption("Mortgage after down payment, flexible compounding ages, optional borrowing with debt APR, and life-like events. Legends are below the chart.")
+st.caption("Income by 5-year buckets; essentials + discretionary spending; flexible compounding; mortgage; borrowing APR; realistic life events. Legends are below the chart.")
 
-col1, col2, col3, col4, col5 = st.columns(5)
-with col1:
-    monthly_income = st.number_input("Monthly income (€)", min_value=0, max_value=100_000, value=4000, step=100)
-with col2:
-    comp_start = st.number_input("Compounds from age", min_value=0, max_value=110, value=25, step=1)
-with col3:
-    comp_end = st.number_input("Compounds until age", min_value=0, max_value=110, value=65, step=1)
-with col4:
-    pct_spent = st.slider("% income spent (earning years)", min_value=0, max_value=95, value=50, step=1)
-with col5:
-    rng_seed = st.number_input("Random seed", min_value=1, max_value=999999, value=137, step=1)
+top1, top2, top3 = st.columns(3)
+with top1:
+    income_start_age = st.number_input("Income start age", 0, 110, 25, 1)
+with top2:
+    income_end_age   = st.number_input("Income end age",   0, 110, 65, 1)
+with top3:
+    rng_seed = st.number_input("Random seed", 1, 999999, 137, 1)
 
-st.divider()
-st.subheader("Borrowing")
-c1, c2 = st.columns(2)
+if income_end_age <= income_start_age:
+    st.error("Income end age must be > income start age.")
+    st.stop()
+
+st.subheader("Income schedule (5-year buckets) — monthly amounts (€)")
+buckets = []
+cols_per_row = 5
+bucket_starts = list(range(income_start_age, income_end_age, 5))
+rows = [bucket_starts[i:i+cols_per_row] for i in range(0, len(bucket_starts), cols_per_row)]
+
+defaults = [4000 + 200*i for i in range(len(bucket_starts))]  # gentle upward default
+for r_i, row in enumerate(rows):
+    cols = st.columns(len(row))
+    for j, start in enumerate(row):
+        end = min(start+5, income_end_age)
+        label = f"{start}–{end}"
+        default_val = defaults[r_i*cols_per_row + j]
+        val = cols[j].number_input(f"{label}", min_value=0, max_value=100_000, value=default_val, step=100)
+        buckets.append({"start": int(start), "end": int(end), "monthly": float(val)})
+
+st.subheader("Compounding")
+c1, c2, c3, c4 = st.columns(4)
 with c1:
-    allow_borrowing = st.checkbox("Allow borrowing (wealth can go negative)", value=False)
+    comp_start_age = st.number_input("Compound starts at age", 0, 110, 25, 1)
 with c2:
-    debt_apr = st.number_input("Debt APR (%)", min_value=0.0, max_value=100.0, value=10.0, step=0.1) / 100.0
+    comp_end_age   = st.number_input("Compound ends at age",   0, 110, 65, 1)
+with c3:
+    growth_rate = st.number_input("Growth CAGR while compounding (%)", 0.0, 50.0, 5.0, 0.1) / 100.0
+with c4:
+    starting_wealth = st.number_input("Starting wealth (€)",  -10_000_000, 10_000_000, 0, 1_000)
+
+st.subheader("Spending model — Essentials + Discretionary %")
+s1, s2, s3 = st.columns(3)
+with s1:
+    essentials_per_year = st.number_input("Essentials per year (€)", 0, 200_000, 18_000, 500)
+with s2:
+    discretionary_pct = st.slider("Discretionary % (of leftover)", 0, 100, 30, 1)
+with s3:
+    apply_disc_after_mortgage = st.checkbox("Apply discretionary after mortgage too", value=False)
+
+st.subheader("Borrowing")
+b1, b2 = st.columns(2)
+with b1:
+    allow_borrowing = st.checkbox("Allow borrowing (wealth can go negative)", value=False)
+with b2:
+    debt_apr = st.number_input("Debt APR (%)", 0.0, 100.0, 10.0, 0.1) / 100.0
 
 st.subheader("Mortgage parameters")
 m1, m2, m3, m4 = st.columns(4)
 with m1:
-    house_price = st.number_input("House price (€)", min_value=0, max_value=5_000_000, value=250_000, step=5_000)
+    house_price = st.number_input("House price (€)", 0, 5_000_000, 250_000, 5_000)
 with m2:
-    down_pct = st.slider("Down payment (%)", min_value=0, max_value=90, value=20, step=1) / 100.0
+    down_pct = st.slider("Down payment (%)", 0, 90, 20, 1) / 100.0
 with m3:
-    mortgage_rate = st.number_input("Mortgage APR (%)", min_value=0.0, max_value=50.0, value=4.0, step=0.1) / 100.0
+    mortgage_rate = st.number_input("Mortgage APR (%)", 0.0, 50.0, 4.0, 0.1) / 100.0
 with m4:
-    mortgage_years = st.number_input("Mortgage term (years)", min_value=1, max_value=60, value=30, step=1)
-
-st.subheader("Portfolio growth")
-growth_rate = st.number_input("Growth CAGR while compounding (%)", min_value=0.0, max_value=50.0, value=5.0, step=0.1) / 100.0
-
-with st.expander("Optional: essentials + discretionary mode"):
-    essentials_mode = st.checkbox("Use essentials + discretionary model", value=False)
-    essentials_per_year = st.number_input("Essentials per year (€)", min_value=0, max_value=200_000, value=18_000, step=500)
+    mortgage_years = st.number_input("Mortgage term (years)", 1, 60, 30, 1)
 
 run = st.button("Run simulation", type="primary")
 
 if run:
     res = run_sim(
-        monthly_income=monthly_income,
-        earn_start_age=int(comp_start),
-        earn_end_age=int(comp_end),
-        percent_income_spent=float(pct_spent),
-        growth_rate=growth_rate,
-        start_age=0, end_age=90,
-        rng_seed=int(rng_seed),
-        house_price=float(house_price),
-        down_pct=float(down_pct),
-        mortgage_rate=float(mortgage_rate),
-        mortgage_years=int(mortgage_years),
-        allow_borrowing=allow_borrowing,
-        debt_apr=float(debt_apr),
-        essentials_mode=essentials_mode,
+        income_schedule=buckets,
+        income_start_age=int(income_start_age),
+        comp_start_age=int(comp_start_age),
+        comp_end_age=int(comp_end_age),
         essentials_per_year=float(essentials_per_year),
+        discretionary_pct=float(discretionary_pct),
+        apply_disc_after_mortgage=bool(apply_disc_after_mortgage),
+        growth_rate=float(growth_rate),
+        start_age=0, end_age=90, rng_seed=int(rng_seed),
+        house_price=float(house_price), down_pct=float(down_pct),
+        mortgage_rate=float(mortgage_rate), mortgage_years=int(mortgage_years),
+        allow_borrowing=bool(allow_borrowing), debt_apr=float(debt_apr),
+        starting_wealth=float(starting_wealth)
     )
-    fig = make_figure(res, monthly_income, int(comp_start), int(comp_end),
-                      float(pct_spent), essentials_mode, float(essentials_per_year))
+    income_desc = "; ".join([f"{b['start']}–{b['end']}: €{int(b['monthly'])}/mo" for b in buckets])
+    fig = make_figure(res, int(comp_start_age), int(comp_end_age),
+                      float(essentials_per_year), float(discretionary_pct),
+                      bool(apply_disc_after_mortgage), income_desc)
     st.pyplot(fig, clear_figure=True)
 
     st.subheader("Generated life events")
@@ -317,5 +333,5 @@ if run:
         mime="text/csv",
     )
 else:
-    st.info("Set inputs and click **Run simulation**.")
+    st.info("Fill the 5-year income buckets and click **Run simulation**.")
 
