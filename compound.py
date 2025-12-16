@@ -5,6 +5,11 @@
 # - Borrowing toggle + Debt APR; positive wealth compounds only between comp ages
 # - Life events realistic by age; none before IncomeStart
 # - Legends placed below plot
+#
+# + Monte Carlo:
+#   - Runs N simulations with randomized life events (via rng_seed+i)
+#   - Optional stochastic annual returns during compounding (Normal around mean CAGR)
+#   - Plots percentile bands + shows final-net-worth distribution
 
 import numpy as np
 import pandas as pd
@@ -23,30 +28,37 @@ def annuity_payment(principal, annual_rate, years):
         return principal / n
     return principal * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
 
+def _sample_age_inclusive(rng: np.random.Generator, low: int, high: int):
+    """Return int in [low, high] or None if invalid range."""
+    if high < low:
+        return None
+    return int(rng.integers(low, high + 1))
+
 def sample_life_events(start_age, end_age, earn_start_age=25, rng_seed=137):
     """Life-like events after earn_start_age; returns [(age, cost, label), ...]."""
     rng = np.random.default_rng(rng_seed)
     ev = []
 
     # 1) Wedding/Honeymoon (25–35, ~60% once)
-    if rng.random() < 0.6 and end_age >= max(earn_start_age, 25):
-        a = int(rng.integers(max(earn_start_age, 25), min(35, end_age) + 1))
-        ev.append((a, rng.uniform(5_000, 20_000), "Wedding/Honeymoon"))
-        if rng.random() < 0.3:
-            ev.append((a, rng.uniform(3_000, 10_000), "Relocation after wedding"))
+    if rng.random() < 0.6:
+        a = _sample_age_inclusive(rng, max(earn_start_age, 25), min(35, end_age))
+        if a is not None:
+            ev.append((a, rng.uniform(5_000, 20_000), "Wedding/Honeymoon"))
+            if rng.random() < 0.3:
+                ev.append((a, rng.uniform(3_000, 10_000), "Relocation after wedding"))
 
     # 2) Children (0–3) 26–38
     n_kids = int(rng.choice([0, 1, 2, 3], p=[0.35, 0.35, 0.22, 0.08]))
     kid_ages = []
     for _ in range(n_kids):
-        if end_age >= max(earn_start_age, 26):
-            a = int(rng.integers(max(earn_start_age, 26), min(38, end_age) + 1))
+        a = _sample_age_inclusive(rng, max(earn_start_age, 26), min(38, end_age))
+        if a is not None:
             kid_ages.append(a)
             ev.append((a, rng.uniform(4_000, 12_000), "Child birth/setup"))
 
     # 3) Car cycles: first 25–35, then every 8–12 yrs until ~75
-    if end_age >= max(earn_start_age, 25):
-        a = int(rng.integers(max(earn_start_age, 25), min(35, end_age) + 1))
+    a = _sample_age_inclusive(rng, max(earn_start_age, 25), min(35, end_age))
+    if a is not None:
         while a <= min(75, end_age):
             ev.append((a, rng.uniform(8_000, 25_000), "Car purchase/major repair"))
             a += int(rng.integers(8, 13))
@@ -54,15 +66,15 @@ def sample_life_events(start_age, end_age, earn_start_age=25, rng_seed=137):
     # 4) Home renovation: 30–60, 0–2 times
     renos = int(rng.choice([0, 1, 2], p=[0.3, 0.5, 0.2]))
     for _ in range(renos):
-        if end_age >= max(earn_start_age, 30):
-            a = int(rng.integers(max(earn_start_age, 30), min(60, end_age) + 1))
+        a = _sample_age_inclusive(rng, max(earn_start_age, 30), min(60, end_age))
+        if a is not None:
             ev.append((a, rng.uniform(10_000, 40_000), "Home renovation"))
 
     # 5) Parental support: 45–65, 0–2 times
     sup = int(rng.choice([0, 1, 2], p=[0.5, 0.35, 0.15]))
     for _ in range(sup):
-        if end_age >= max(earn_start_age, 45):
-            a = int(rng.integers(max(earn_start_age, 45), min(65, end_age) + 1))
+        a = _sample_age_inclusive(rng, max(earn_start_age, 45), min(65, end_age))
+        if a is not None:
             ev.append((a, rng.uniform(5_000, 20_000), "Parental support"))
 
     # 6) College contributions (kid birth age + 18)
@@ -81,7 +93,7 @@ def sample_life_events(start_age, end_age, earn_start_age=25, rng_seed=137):
             cost = float(np.clip(cost, 5_000, 120_000))
             ev.append((a, cost, "Medical procedure"))
 
-    # 8) Long-term care: 75+, ~12%/yr, at most once (seeded consistently)
+    # 8) Long-term care: 75+, ~12%/yr, at most once
     ltc = False
     for a in range(max(earn_start_age, 75), end_age + 1):
         if (not ltc) and (rng.random() < 0.12):
@@ -128,8 +140,16 @@ def run_sim(
     debt_apr=0.10,
     # Starting wealth
     starting_wealth=0.0,
+    # Monte Carlo / stochastic returns
+    stochastic_returns=False,
+    return_volatility=0.0,      # annual std-dev of returns during compounding (e.g., 0.15 for 15%)
+    clamp_return_min=-0.95,     # avoid "return <= -100%" numerics
+    clamp_return_max=2.0,
 ):
-    events = sample_life_events(start_age, end_age, earn_start_age=income_start_age, rng_seed=rng_seed)
+    # Use ONE rng stream per run for returns; life events get their own deterministic seed (derived from rng_seed)
+    rng = np.random.default_rng(int(rng_seed))
+    life_seed = int(rng.integers(0, 2**31 - 1))
+    events = sample_life_events(start_age, end_age, earn_start_age=income_start_age, rng_seed=life_seed)
     event_costs = {a: cost for a, cost, _ in events}
 
     # Balance-sheet components
@@ -139,7 +159,6 @@ def run_sim(
     monthly_payment = 0.0
 
     ages, net_worth_series = [], []
-    saved_for_down = 0.0
     mortgage_started = False
     mortgage_start_age = None
 
@@ -150,20 +169,18 @@ def run_sim(
 
         yearly_income = monthly_income * 12.0 if earning else 0.0
 
-        # Essentials + discretionary
         essentials = float(essentials_per_year) if earning else 0.0
-
         mortgage_active = mortgage_started and (mort_balance > 1e-6)
         current_year_mortgage_payment = 12.0 * monthly_payment if mortgage_active else 0.0
 
         # Check start conditions for mortgage at the *start* of the year
         if enable_mortgage and (not mortgage_started) and earning:
-            down_needed = house_price * down_pct
-            if (age >= earliest_mortgage_age) and (cash_wealth >= down_needed):
+            down_needed = float(house_price) * float(down_pct)
+            if (age >= int(earliest_mortgage_age)) and (cash_wealth >= down_needed):
                 cash_wealth -= down_needed
                 house_value = float(house_price)
                 mort_balance = float(house_price) * (1.0 - float(down_pct))
-                monthly_payment = float(annuity_payment(mort_balance, mortgage_rate, mortgage_years))
+                monthly_payment = float(annuity_payment(mort_balance, float(mortgage_rate), int(mortgage_years)))
                 mortgage_started = True
                 mortgage_start_age = age
                 mortgage_active = mort_balance > 1e-6
@@ -185,13 +202,8 @@ def run_sim(
         # Total non-mortgage outflows this year
         non_mortgage_outflow = essentials + discretionary + life_event_expense
 
-        # Cash flow pre-mortgage-payment
-        net_cash_flow = yearly_income - non_mortgage_outflow
-        if (not mortgage_started) and earning and (net_cash_flow > 0.0):
-            saved_for_down += net_cash_flow
-
         # Apply non-mortgage cash flow to cash
-        cash_wealth += net_cash_flow
+        cash_wealth += (yearly_income - non_mortgage_outflow)
 
         # If borrowing is disabled, don't allow negative cash to "fund" mortgage payments.
         if (not allow_borrowing) and (cash_wealth < 0.0):
@@ -199,7 +211,7 @@ def run_sim(
 
         # Apply mortgage payments (monthly). Don't reduce balance unless you actually paid.
         if mortgage_started and mort_balance > 1e-6:
-            m_rate = mortgage_rate / 12.0
+            m_rate = float(mortgage_rate) / 12.0
             for _ in range(12):
                 if mort_balance <= 1e-6:
                     break
@@ -221,10 +233,15 @@ def run_sim(
                 mort_balance = 0.0
                 monthly_payment = 0.0
 
-        # Apply interest/growth on cash_wealth
+        # Apply returns / debt cost
         if cash_wealth >= 0.0:
             if compounding:
-                cash_wealth *= (1.0 + float(growth_rate))
+                if stochastic_returns and (return_volatility > 0.0):
+                    r = float(rng.normal(loc=float(growth_rate), scale=float(return_volatility)))
+                    r = float(np.clip(r, clamp_return_min, clamp_return_max))
+                    cash_wealth *= (1.0 + r)
+                else:
+                    cash_wealth *= (1.0 + float(growth_rate))
         else:
             if allow_borrowing:
                 cash_wealth *= (1.0 + float(debt_apr))
@@ -242,17 +259,59 @@ def run_sim(
 
     return {
         "ages": ages,
-        "values": net_worth_series,   # NET WORTH
+        "values": net_worth_series,
         "events": events,
         "mortgage_start_age": mortgage_start_age,
         "df_events": df_events,
     }
 
-def make_figure(
-    res, comp_start_age, comp_end_age, essentials_per_year,
-    discretionary_pct, apply_disc_after_mortgage, income_desc,
-    starting_wealth, enable_mortgage
+def run_monte_carlo(
+    n_sims: int,
+    base_seed: int,
+    **sim_kwargs
 ):
+    """Run n_sims independent runs; return percentile bands + final distribution."""
+    n_sims = int(n_sims)
+    if n_sims <= 0:
+        raise ValueError("n_sims must be > 0")
+
+    # Run once to get age axis length
+    first = run_sim(rng_seed=base_seed, **sim_kwargs)
+    ages = np.asarray(first["ages"], dtype=int)
+    t = len(ages)
+
+    paths = np.empty((n_sims, t), dtype=float)
+    finals = np.empty(n_sims, dtype=float)
+
+    paths[0, :] = np.asarray(first["values"], dtype=float)
+    finals[0] = paths[0, -1]
+
+    for i in range(1, n_sims):
+        res = run_sim(rng_seed=base_seed + i, **sim_kwargs)
+        v = np.asarray(res["values"], dtype=float)
+        if len(v) != t:
+            raise RuntimeError("Simulation produced inconsistent horizon length.")
+        paths[i, :] = v
+        finals[i] = v[-1]
+
+    pct_levels = np.array([5, 25, 50, 75, 95], dtype=float)
+    bands = np.percentile(paths, pct_levels, axis=0)
+
+    # Summary stats
+    final_pcts = np.percentile(finals, pct_levels)
+    out = {
+        "ages": ages,
+        "pct_levels": pct_levels,
+        "bands": bands,          # shape (5, T)
+        "finals": finals,
+        "final_pcts": final_pcts,
+        "paths": paths,          # keep (handy for debugging / downloads)
+    }
+    return out
+
+def make_figure_single(res, comp_start_age, comp_end_age, essentials_per_year,
+                       discretionary_pct, apply_disc_after_mortgage, income_desc,
+                       starting_wealth, enable_mortgage):
     ages, values = res["ages"], res["values"]
     events = res["events"]
     mort_marker_age = res["mortgage_start_age"]
@@ -298,16 +357,38 @@ def make_figure(
             ncol=2, frameon=True
         )
 
-    # Reserve space for legends placed below the axes (tight_layout won't account for them).
     fig.subplots_adjust(bottom=0.42 if ev_handles else 0.26)
+    return fig
+
+def make_figure_mc(mc_res, title_suffix=""):
+    ages = mc_res["ages"]
+    bands = mc_res["bands"]  # rows: 5,25,50,75,95
+    p5, p25, p50, p75, p95 = bands
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    ax.fill_between(ages, p5, p95, alpha=0.15, label="5–95%")
+    ax.fill_between(ages, p25, p75, alpha=0.25, label="25–75%")
+    ax.plot(ages, p50, linewidth=2.0, label="Median (50%)")
+    ax.set_xlabel("Age (years)")
+    ax.set_ylabel("Net Worth (€)")
+    ax.set_title(f"Monte Carlo Net Worth Bands{title_suffix}")
+    ax.grid(True)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3, frameon=True)
+    fig.subplots_adjust(bottom=0.22)
     return fig
 
 # ---------- UI ----------
 
 st.set_page_config(page_title="Wealth Simulator (5-year incomes)", layout="wide")
 st.title("Wealth Simulator")
-st.caption("Net worth with 5-year income buckets, essentials+discretionary spending, optional mortgage (asset & liability), borrowing APR, and realistic life events. Legends are below the chart.")
+st.caption(
+    "Net worth with 5-year income buckets, essentials+discretionary spending, optional mortgage (asset & liability), "
+    "borrowing APR, realistic life events, plus Monte Carlo percentile bands."
+)
 
+tab_single, tab_mc = st.tabs(["Single run", "Monte Carlo"])
+
+# Shared inputs (both tabs)
 top1, top2, top3, top4 = st.columns(4)
 with top1:
     income_start_age = st.number_input("Income start age", 0, 110, 25, 1)
@@ -316,7 +397,7 @@ with top2:
 with top3:
     starting_wealth = st.number_input("Starting wealth (€)", -10_000_000, 10_000_000, 0, 1_000)
 with top4:
-    rng_seed = st.number_input("Random seed", 1, 999999, 137, 1)
+    rng_seed = st.number_input("Random seed (base)", 1, 999999, 137, 1)
 
 if income_end_age <= income_start_age:
     st.error("Income end age must be > income start age.")
@@ -351,7 +432,7 @@ with c1:
 with c2:
     comp_end_age = st.number_input("Compound ends at age", 0, 110, 65, 1)
 with c3:
-    growth_rate = st.number_input("Growth CAGR while compounding (%)", 0.0, 50.0, 5.0, 0.1) / 100.0
+    growth_rate = st.number_input("Mean CAGR while compounding (%)", 0.0, 50.0, 5.0, 0.1) / 100.0
 
 st.subheader("Spending — Essentials + Discretionary %")
 s1, s2, s3 = st.columns(3)
@@ -384,54 +465,159 @@ with m4:
 with m5:
     mortgage_years = st.number_input("Mortgage term (years)", 1, 60, 30, 1)
 
-run = st.button("Run simulation", type="primary")
+income_desc = "; ".join([f"{b['start']}–{b['end']}: €{int(b['monthly'])}/mo" for b in buckets])
 
-if run:
-    res = run_sim(
-        income_schedule=buckets,
-        income_start_age=int(income_start_age),
-        comp_start_age=int(comp_start_age),
-        comp_end_age=int(comp_end_age),
-        essentials_per_year=float(essentials_per_year),
-        discretionary_pct=float(discretionary_pct),
-        apply_disc_after_mortgage=bool(apply_disc_after_mortgage),
-        growth_rate=float(growth_rate),
-        start_age=0,
-        end_age=90,
-        rng_seed=int(rng_seed),
-        enable_mortgage=bool(enable_mortgage),
-        earliest_mortgage_age=int(earliest_mortgage_age),
-        house_price=float(house_price),
-        down_pct=float(down_pct),
-        mortgage_rate=float(mortgage_rate),
-        mortgage_years=int(mortgage_years),
-        allow_borrowing=bool(allow_borrowing),
-        debt_apr=float(debt_apr),
-        starting_wealth=float(starting_wealth),
-    )
+# ---------------- Single run tab ----------------
+with tab_single:
+    run_single = st.button("Run single simulation", type="primary", key="run_single")
+    if run_single:
+        res = run_sim(
+            income_schedule=buckets,
+            income_start_age=int(income_start_age),
+            comp_start_age=int(comp_start_age),
+            comp_end_age=int(comp_end_age),
+            essentials_per_year=float(essentials_per_year),
+            discretionary_pct=float(discretionary_pct),
+            apply_disc_after_mortgage=bool(apply_disc_after_mortgage),
+            growth_rate=float(growth_rate),
+            start_age=0,
+            end_age=90,
+            rng_seed=int(rng_seed),
+            enable_mortgage=bool(enable_mortgage),
+            earliest_mortgage_age=int(earliest_mortgage_age),
+            house_price=float(house_price),
+            down_pct=float(down_pct),
+            mortgage_rate=float(mortgage_rate),
+            mortgage_years=int(mortgage_years),
+            allow_borrowing=bool(allow_borrowing),
+            debt_apr=float(debt_apr),
+            starting_wealth=float(starting_wealth),
+            stochastic_returns=False,
+            return_volatility=0.0,
+        )
 
-    income_desc = "; ".join([f"{b['start']}–{b['end']}: €{int(b['monthly'])}/mo" for b in buckets])
-    fig = make_figure(
-        res,
-        int(comp_start_age),
-        int(comp_end_age),
-        float(essentials_per_year),
-        float(discretionary_pct),
-        bool(apply_disc_after_mortgage),
-        income_desc,
-        float(starting_wealth),
-        bool(enable_mortgage),
-    )
-    st.pyplot(fig, clear_figure=True)
+        fig = make_figure_single(
+            res,
+            int(comp_start_age),
+            int(comp_end_age),
+            float(essentials_per_year),
+            float(discretionary_pct),
+            bool(apply_disc_after_mortgage),
+            income_desc,
+            float(starting_wealth),
+            bool(enable_mortgage),
+        )
+        st.pyplot(fig, clear_figure=True)
 
-    st.subheader("Generated life events")
-    st.dataframe(res["df_events"], use_container_width=True)
-    st.download_button(
-        "Download events CSV",
-        data=res["df_events"].to_csv(index=False).encode("utf-8"),
-        file_name="lifelike_events.csv",
-        mime="text/csv",
-    )
-else:
-    st.info("Fill the 5-year income buckets and click **Run simulation**.")
+        st.subheader("Generated life events (single run)")
+        st.dataframe(res["df_events"], use_container_width=True)
+        st.download_button(
+            "Download events CSV",
+            data=res["df_events"].to_csv(index=False).encode("utf-8"),
+            file_name="lifelike_events.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("Fill the 5-year income buckets and click **Run single simulation**.")
+
+# ---------------- Monte Carlo tab ----------------
+with tab_mc:
+    st.subheader("Monte Carlo settings")
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    with mc1:
+        n_sims = st.number_input("Simulations", min_value=10, max_value=50000, value=300, step=10)
+    with mc2:
+        stochastic_returns = st.checkbox("Stochastic returns during compounding", value=True)
+    with mc3:
+        return_vol = st.number_input("Return volatility σ (%/yr)", 0.0, 100.0, 15.0, 0.5) / 100.0
+    with mc4:
+        target_final = st.number_input("Target final net worth (€)", 0, 50_000_000, 1_000_000, 50_000)
+
+    run_mc = st.button("Run Monte Carlo", type="primary", key="run_mc")
+
+    if run_mc:
+        mc_res = run_monte_carlo(
+            n_sims=int(n_sims),
+            base_seed=int(rng_seed),
+            income_schedule=buckets,
+            income_start_age=int(income_start_age),
+            comp_start_age=int(comp_start_age),
+            comp_end_age=int(comp_end_age),
+            essentials_per_year=float(essentials_per_year),
+            discretionary_pct=float(discretionary_pct),
+            apply_disc_after_mortgage=bool(apply_disc_after_mortgage),
+            growth_rate=float(growth_rate),
+            start_age=0,
+            end_age=90,
+            enable_mortgage=bool(enable_mortgage),
+            earliest_mortgage_age=int(earliest_mortgage_age),
+            house_price=float(house_price),
+            down_pct=float(down_pct),
+            mortgage_rate=float(mortgage_rate),
+            mortgage_years=int(mortgage_years),
+            allow_borrowing=bool(allow_borrowing),
+            debt_apr=float(debt_apr),
+            starting_wealth=float(starting_wealth),
+            stochastic_returns=bool(stochastic_returns),
+            return_volatility=float(return_vol) if stochastic_returns else 0.0,
+        )
+
+        title_suffix = f" (N={int(n_sims)}, μ={growth_rate*100:.1f}%"
+        if stochastic_returns:
+            title_suffix += f", σ={return_vol*100:.1f}%)"
+        else:
+            title_suffix += ")"
+
+        fig = make_figure_mc(mc_res, title_suffix=title_suffix)
+        st.pyplot(fig, clear_figure=True)
+
+        finals = mc_res["finals"]
+        p5, p25, p50, p75, p95 = mc_res["final_pcts"]
+
+        cA, cB, cC, cD, cE = st.columns(5)
+        cA.metric("Final P5", f"€{p5:,.0f}")
+        cB.metric("Final P25", f"€{p25:,.0f}")
+        cC.metric("Final Median", f"€{p50:,.0f}")
+        cD.metric("Final P75", f"€{p75:,.0f}")
+        cE.metric("Final P95", f"€{p95:,.0f}")
+
+        prob_below_zero = float(np.mean(finals < 0.0)) * 100.0
+        prob_hit_target = float(np.mean(finals >= float(target_final))) * 100.0
+        st.write(
+            f"- P(final net worth < 0): **{prob_below_zero:.1f}%**\n"
+            f"- P(final net worth ≥ €{float(target_final):,.0f}): **{prob_hit_target:.1f}%**"
+        )
+
+        # Downloads
+        ages = mc_res["ages"]
+        bands = mc_res["bands"]
+        df_bands = pd.DataFrame(
+            {
+                "Age": ages,
+                "P5": bands[0],
+                "P25": bands[1],
+                "P50": bands[2],
+                "P75": bands[3],
+                "P95": bands[4],
+            }
+        )
+        df_finals = pd.DataFrame({"FinalNetWorth": finals})
+
+        st.download_button(
+            "Download MC percentile bands (CSV)",
+            data=df_bands.to_csv(index=False).encode("utf-8"),
+            file_name="mc_percentile_bands.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download MC final net worth samples (CSV)",
+            data=df_finals.to_csv(index=False).encode("utf-8"),
+            file_name="mc_final_net_worth.csv",
+            mime="text/csv",
+        )
+
+        st.subheader("Monte Carlo bands table")
+        st.dataframe(df_bands, use_container_width=True)
+    else:
+        st.info("Configure Monte Carlo settings and click **Run Monte Carlo**.")
 
