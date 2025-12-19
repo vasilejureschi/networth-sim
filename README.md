@@ -1,1 +1,1 @@
-# networth-sim
+Vibecoded networth Montecarlo simulation
